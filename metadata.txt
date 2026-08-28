@@ -1,0 +1,20 @@
+[general]
+name=Layout Splines
+description=Adds editable spline polyline and spline polygon node items to QGIS Layout Designer.
+about=Adds Spline Polyline and Spline Polygon items to the Layout Designer's Add Node Item group. Cubic Bezier anchors and their incoming and outgoing control handles can be edited using QGIS's native Edit Nodes tool. Items retain the native polyline and polygon symbol, layout, undo, template, and project serialization behavior.
+version=1.0.0
+qgisMinimumVersion=3.42
+qgisMaximumVersion=4.99
+author=Jani Maps
+email=info@janimaps.co.ke
+icon=icons/spline_polyline.png
+category=Layouts
+tags=layout,print layout,spline,bezier,polyline,polygon,nodes
+homepage=https://github.com/janimaps/qgis-layout-splines
+repository=https://github.com/janimaps/qgis-layout-splines
+tracker=https://github.com/janimaps/qgis-layout-splines/issues
+experimental=False
+deprecated=False
+server=False
+hasProcessingProvider=False
+changelog=Initial release.
