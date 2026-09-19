@@ -7,6 +7,8 @@ Layout Splines adds two node-based items to every QGIS Layout Designer:
 
 The items use real cubic Bezier control handles. Select QGIS's **Edit Nodes Item** tool and select the spline. QGIS displays all editable nodes; every anchor is connected to its incoming and outgoing control nodes by blue dashed guide lines. Paired handles move symmetrically by default. Hold **Ctrl** on Windows/Linux or **Command** on macOS while dragging to move one handle independently.
 
+![Layout Splines example](icons/Splinetools_v1.0.1.jpg)
+
 ## Compatibility
 
 - QGIS 3.42 (Qt 5 / PyQt 5)
@@ -18,7 +20,7 @@ The plugin imports Qt exclusively through `qgis.PyQt` and uses the layout regist
 
 1. In QGIS, choose **Plugins > Manage and Install Plugins**.
 2. Open **Install from ZIP**.
-3. Select `qgis_layout_splines-1.0.0.zip` and install it.
+3. Select `qgis_layout_splines-1.0.1.zip` and install it.
 4. Open or create a Print Layout.
 5. Open the **Add Node Item** drop-down. **Spline Polygon** and **Spline Polyline** appear in that order.
 6. Click to add a normal anchor, or click-drag to add an anchor with a mirrored Bezier handle pair. Right-click finishes the item. Backspace removes the last inserted anchor (and cancels when only the first anchor remains), matching QGIS node-item creation behavior.
@@ -42,11 +44,4 @@ GNU General Public License v2 or later.
 
 ## Missing-plugin recovery
 
-Each spline stores an exact recovery snapshot in the owning layout's custom
-properties. QGIS serializes these layout properties using its native layout XML,
-so they remain in the project even if the plugin is unavailable and the project
-is subsequently saved. No native fallback polygon/polyline is created: without
-Layout Splines the preserved items are not rendered and cannot be edited with
-QGIS's normal node tools. When the plugin is available again and the Layout
-Designer is opened, missing spline items are reconstructed automatically from
-the preserved snapshots.
+Each spline stores an exact recovery snapshot in the owning layout's custom properties. QGIS serializes these layout properties using its native layout XML,so they remain in the project even if the plugin is unavailable and the project is subsequently saved. No native fallback polygon/polyline is created: without Layout Splines the preserved items are not rendered and cannot be edited with QGIS's normal node tools. When the plugin is available again and the Layout Designer is opened, missing spline items are reconstructed automatically from the preserved snapshots.

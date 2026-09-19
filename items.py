@@ -4,7 +4,7 @@ import json
 import math
 import os
 
-from qgis.PyQt.QtCore import QPointF, QRectF
+from qgis.PyQt.QtCore import QPointF, QRectF, Qt
 from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPainterPathStroker, QPen, QPolygonF, QTransform
 from qgis.PyQt.QtSvg import QSvgRenderer
 from qgis.core import QgsGeometry, QgsLayoutItemPolygon, QgsLayoutItemPolyline, Qgis
@@ -161,10 +161,28 @@ class _BezierHandleMixin:
 
     def boundingRect(self):
         native = super().boundingRect()
-        curve = self._path().controlPointRect()
+        curve = self._path().boundingRect()
         bleed = max(self.estimatedFrameBleed(), 0.4)
         curve.adjust(-bleed, -bleed, bleed, bleed)
         return native.united(curve)
+
+    def _clear_selection_bounds_decoration(self):
+        """Compatibility hook for older controllers.
+
+        Selection bounds are drawn by the view controller overlay, not by the
+        layout item paint routine. Keeping this method as a no-op avoids stale
+        item-painted marks and lets the controller call it safely across builds.
+        """
+        self._layout_splines_draw_selection_bounds = False
+        self._layout_splines_last_selection_bounds_rect = None
+        try:
+            self.update()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _draw_selection_bounds(self, painter, render_context):
+        """Selection bounds are handled by the transient scene overlay."""
+        return
 
 
 class SplinePolyline(_BezierHandleMixin, QgsLayoutItemPolyline):
@@ -196,6 +214,7 @@ class SplinePolyline(_BezierHandleMixin, QgsLayoutItemPolyline):
             self._draw_marker(painter, curve, True)
             self._draw_marker(painter, curve, False)
         finally: painter.restore()
+        self._draw_selection_bounds(painter, render_context)
 
     def _draw_marker(self, painter, curve, at_start):
         mode = self.startMarker() if at_start else self.endMarker()
@@ -246,6 +265,7 @@ class SplinePolygon(_BezierHandleMixin, QgsLayoutItemPolygon):
             try: symbol.renderPolygon(mapped, None, None, render_context)
             finally: symbol.stopRender(render_context)
         finally: painter.restore()
+        self._draw_selection_bounds(painter, render_context)
 
     def shape(self): return self._path()
 

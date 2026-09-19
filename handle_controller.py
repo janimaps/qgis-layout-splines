@@ -6,7 +6,7 @@ import weakref
 
 from qgis.PyQt.QtCore import QEvent, QLineF, QObject, QPoint, QPointF, QRectF, Qt, QTimer
 from qgis.PyQt.QtGui import QBrush, QColor, QPainterPath, QPen
-from qgis.PyQt.QtWidgets import QApplication, QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem
+from qgis.PyQt.QtWidgets import QApplication, QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsRectItem
 from qgis.gui import QgsGui, QgsLayoutViewToolAddNodeItem, QgsLayoutViewToolEditNodes
 
 from .items import SPLINE_POLYGON_TYPE, SPLINE_POLYLINE_TYPE
@@ -85,6 +85,21 @@ def _ignore_transformations_flag():
         return getattr(QGraphicsItem, name)
 
 
+def _scene_rect_from_local(item, local_rect):
+    """Map a local item rectangle to a normalized scene rectangle."""
+    points = [
+        QPointF(local_rect.left(), local_rect.top()),
+        QPointF(local_rect.right(), local_rect.top()),
+        QPointF(local_rect.right(), local_rect.bottom()),
+        QPointF(local_rect.left(), local_rect.bottom()),
+    ]
+    scene_points = [item.mapToScene(point) for point in points]
+    rect = QRectF(scene_points[0], scene_points[0])
+    for point in scene_points[1:]:
+        rect = rect.united(QRectF(point, point))
+    return rect.normalized()
+
+
 def _is_preview(layout):
     try:
         return layout is not None and layout.renderContext().isPreviewRender()
@@ -111,7 +126,7 @@ class _GuideOverlayItem(QGraphicsItem):
         self.setZValue(1.0e9)
         self.setAcceptedMouseButtons(_no_button())
 
-        self._pen = QPen(QColor(30, 144, 255, 220))
+        self._pen = QPen(_GUIDE_GREEN)
         self._pen.setWidthF(1.5)
         self._pen.setCosmetic(True)
         self._pen.setStyle(_dash_line())
@@ -220,42 +235,148 @@ class _CreationPreviewItem(QGraphicsPathItem):
             painter.restore()
 
 
-class _PreviewHandleItem(QGraphicsEllipseItem):
-    """Constant-screen-size control circle anchored at a scene position."""
+class _SelectionBoundsOverlayItem(QGraphicsItem):
+    """Non-interactive selection bounds drawn from the visible spline extent.
+
+    QGIS' native mouse-handle frame for QgsLayoutNodesItem is derived from the
+    anchor-node item rectangle. This overlay paints a QGIS-like frame around the
+    rendered Bezier curve extent while leaving the native mouse-handle item
+    alive and transparent for selection/move hit testing. Because it is a
+    separate scene item, it can be removed immediately on deselection without
+    leaving stale item-painted corner marks.
+    """
 
     def __init__(self, layout):
-        super().__init__(-6.0, -6.0, 12.0, 12.0)
+        super().__init__()
         self._layout = layout
-        self._normal_pen = QPen(QColor(30, 144, 255, 235))
-        self._normal_pen.setWidthF(1.5)
+        self._rect = QRectF()
+        self.setZValue(1.0e9 + 1.0)
+        self.setAcceptedMouseButtons(_no_button())
+        self._pen = QPen(QColor(0, 145, 255, 235))
+        self._pen.setWidthF(1.0)
+        self._pen.setCosmetic(True)
+        self._handle_pen = QPen(QColor(0, 145, 255, 235))
+        self._handle_pen.setWidthF(1.0)
+        self._handle_pen.setCosmetic(True)
+        self._handle_brush = QBrush(QColor(255, 255, 255, 255))
+        self.hide()
+
+    def boundingRect(self):
+        if self._rect.isNull():
+            return QRectF()
+        rect = QRectF(self._rect)
+        rect.adjust(-7.0, -7.0, 7.0, 7.0)
+        return rect
+
+    def setSceneRect(self, rect):
+        new_rect = QRectF(rect).normalized() if rect is not None else QRectF()
+        if new_rect != self._rect:
+            self.prepareGeometryChange()
+            self._rect = new_rect
+        self.setVisible(not new_rect.isNull() and new_rect.isValid())
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        # This item is a GUI-only selection decoration owned by the layout view
+        # controller. Paint it whenever it is visible in the scene; exports use
+        # the layout renderer rather than this transient view overlay. Avoid an
+        # isPreviewRender() guard here because some QGIS builds report false
+        # while painting cosmetic view overlays in Select/Move mode.
+        if self._rect.isNull():
+            return
+        painter.save()
+        try:
+            painter.setPen(self._pen)
+            painter.setBrush(_no_brush())
+            painter.drawRect(self._rect)
+            painter.setPen(self._handle_pen)
+            painter.setBrush(self._handle_brush)
+            # Match QGIS' default selection grip feel: handles should be
+            # screen-pixel sized, not layout-unit sized.  The overlay is drawn
+            # in scene coordinates, so convert a small pixel size through the
+            # active painter transform.
+            transform = painter.worldTransform()
+            scale_x = math.hypot(transform.m11(), transform.m12())
+            scale_y = math.hypot(transform.m22(), transform.m21())
+            scale = max(scale_x, scale_y, 1.0e-9)
+            size = 6.0 / scale
+            half = size / 2.0
+            x0, x1 = self._rect.left(), self._rect.right()
+            y0, y1 = self._rect.top(), self._rect.bottom()
+            xm, ym = self._rect.center().x(), self._rect.center().y()
+            for point in (
+                QPointF(x0, y0), QPointF(xm, y0), QPointF(x1, y0),
+                QPointF(x1, ym), QPointF(x1, y1), QPointF(xm, y1),
+                QPointF(x0, y1), QPointF(x0, ym),
+            ):
+                painter.drawRect(QRectF(point.x() - half, point.y() - half, size, size))
+        finally:
+            painter.restore()
+
+
+_NODE_GREEN = QColor(89, 158, 130, 255)
+_NODE_GREEN_FILL = QColor(232, 245, 238, 255)
+_NODE_GREEN_HOVER_FILL = QColor(206, 232, 222, 255)
+_NODE_ORANGE = QColor(242, 142, 28, 255)
+_GUIDE_GREEN = QColor(89, 158, 130, 155)
+
+
+class _StyledEndpointMixin:
+    """Shared QGIS-like green/orange styling for spline edit markers."""
+
+    def _init_style(self, layout):
+        self._layout = layout
+        self._normal_pen = QPen(_NODE_GREEN)
+        self._normal_pen.setWidthF(1.15)
         self._normal_pen.setCosmetic(True)
-        self._hover_pen = QPen(QColor(30, 144, 255, 255))
-        self._hover_pen.setWidthF(3.0)
+        self._hover_pen = QPen(_NODE_GREEN)
+        self._hover_pen.setWidthF(1.7)
         self._hover_pen.setCosmetic(True)
-        self._normal_brush = QBrush(QColor(255, 255, 255, 245))
-        self._hover_brush = QBrush(QColor(30, 144, 255, 90))
-        self.setHovered(False)
+        self._active_pen = QPen(_NODE_ORANGE)
+        self._active_pen.setWidthF(1.3)
+        self._active_pen.setCosmetic(True)
+        self._normal_brush = QBrush(_NODE_GREEN_FILL)
+        self._hover_brush = QBrush(_NODE_GREEN_HOVER_FILL)
+        self._active_brush = QBrush(_NODE_ORANGE)
+        self.setState(False, False)
+
+    def setState(self, hovered=False, active=False):
+        if active:
+            self.setPen(self._active_pen)
+            self.setBrush(self._active_brush)
+        elif hovered:
+            self.setPen(self._hover_pen)
+            self.setBrush(self._hover_brush)
+        else:
+            self.setPen(self._normal_pen)
+            self.setBrush(self._normal_brush)
 
     def setHovered(self, hovered):
-        self.setPen(self._hover_pen if hovered else self._normal_pen)
-        self.setBrush(self._hover_brush if hovered else self._normal_brush)
+        self.setState(hovered, False)
 
     def paint(self, painter, option, widget=None):
         if _is_preview(self._layout):
             super().paint(painter, option, widget)
 
 
-class _HoverAnchorItem(_PreviewHandleItem):
-    """Non-interactive ring used only to identify the hovered native anchor."""
+class _PreviewHandleItem(_StyledEndpointMixin, QGraphicsRectItem):
+    """Constant-screen-size square Bezier control endpoint."""
 
     def __init__(self, layout):
-        super().__init__(layout)
-        self.setRect(-7.0, -7.0, 14.0, 14.0)
-        pen = QPen(QColor(30, 144, 255, 255))
-        pen.setWidthF(3.0)
-        pen.setCosmetic(True)
-        self.setPen(pen)
-        self.setBrush(QBrush(QColor(255, 255, 255, 0)))
+        super().__init__(-4.0, -4.0, 8.0, 8.0)
+        self._init_style(layout)
+
+
+class _AnchorOverlayItem(_StyledEndpointMixin, QGraphicsEllipseItem):
+    """Constant-screen-size circular anchor marker overlay."""
+
+    def __init__(self, layout):
+        super().__init__(-5.5, -5.5, 11.0, 11.0)
+        self._init_style(layout)
+
+
+class _HoverAnchorItem(_AnchorOverlayItem):
+    """Backward-compatible alias for older controller code paths."""
 
 
 class BezierHandleController(QObject):
@@ -267,6 +388,8 @@ class BezierHandleController(QObject):
         self._active_anchor = None
         self._handle_overlays = []
         self._overlay_keys = []
+        self._anchor_overlays = []
+        self._anchor_overlay_keys = []
         self._hover_target = None
         self._creation_type = None
         self._creation_drags = []
@@ -289,6 +412,13 @@ class BezierHandleController(QObject):
         view.scene().addItem(self._hover_anchor_overlay)
         self._creation_preview = _CreationPreviewItem(self.layout)
         view.scene().addItem(self._creation_preview)
+        self._selection_bounds_overlay = _SelectionBoundsOverlayItem(self.layout)
+        view.scene().addItem(self._selection_bounds_overlay)
+        self._selection_bounds_item = None
+        self._selection_drag_item = None
+        self._selection_drag_start_scene = None
+        self._selection_drag_start_rect = QRectF()
+        self._selection_candidate_press_scene = None
 
         # Dedicated snap feedback lines for spline-anchor drags.  We cannot let
         # QgsLayoutViewToolEditNodes own these drags (it may pick a nearby node
@@ -334,7 +464,7 @@ class BezierHandleController(QObject):
         # the QGraphicsView itself, while mouse events are sent to its viewport.
         view.installEventFilter(self)
         view.toolSet.connect(self._tool_changed)
-        view.scene().selectionChanged.connect(self._queue_overlay_sync)
+        view.scene().selectionChanged.connect(self._selection_changed)
         if self.layout is not None:
             self.layout.itemAdded.connect(self._layout_item_added)
         self._sync_overlay()
@@ -378,7 +508,7 @@ class BezierHandleController(QObject):
             return_value = None
             del return_value
         try:
-            self.view.scene().selectionChanged.disconnect(self._queue_overlay_sync)
+            self.view.scene().selectionChanged.disconnect(self._selection_changed)
         except (TypeError, RuntimeError):
             # The view/scene may already be in Qt teardown.
             return_value = None
@@ -404,10 +534,13 @@ class BezierHandleController(QObject):
             scene.removeItem(self._guide_overlay)
             scene.removeItem(self._hover_anchor_overlay)
             scene.removeItem(self._creation_preview)
+            scene.removeItem(self._selection_bounds_overlay)
             scene.removeItem(self._horizontal_snap_line)
             scene.removeItem(self._vertical_snap_line)
             for handle in self._handle_overlays:
                 scene.removeItem(handle)
+            for anchor_overlay in self._anchor_overlays:
+                scene.removeItem(anchor_overlay)
         except RuntimeError:
             # Scene deletion owns and removes the graphics items automatically.
             return_value = None
@@ -415,6 +548,18 @@ class BezierHandleController(QObject):
         self._handle_overlays.clear()
         self._overlay_keys.clear()
         self._hover_target = None
+        bounds_item = getattr(self, "_selection_bounds_item", None)
+        if bounds_item is not None:
+            try:
+                if hasattr(bounds_item, "_clear_selection_bounds_decoration"):
+                    bounds_item._clear_selection_bounds_decoration()
+                else:
+                    bounds_item._layout_splines_draw_selection_bounds = False
+                    bounds_item.update()
+            except (AttributeError, RuntimeError):
+                pass
+            self._selection_bounds_item = None
+
         # Do not touch QGIS-owned mouse-handle graphics items during unload.
         # QGIS may already have destroyed their C++ instances even while stale
         # Python wrappers still exist, and calling QGraphicsItem methods on such
@@ -422,6 +567,86 @@ class BezierHandleController(QObject):
         _CONTROLLERS_BY_VIEW.pop(id(self.view), None)
         self._clear_creation_state()
         self._pending_creation = None
+
+
+
+    def _current_selection_bounds_rect(self):
+        """Return the visible Bezier-path selection bounds in scene coordinates."""
+        item = getattr(self, "_selection_bounds_item", None)
+        if item is None:
+            return QRectF()
+        try:
+            if not item.isSelected() or item.type() not in (SPLINE_POLYGON_TYPE, SPLINE_POLYLINE_TYPE):
+                return QRectF()
+            local_path = item._path()
+            if local_path.isEmpty():
+                return QRectF()
+            rect = item.mapToScene(local_path).boundingRect().normalized()
+            if rect.isValid() and not rect.isNull():
+                rect.adjust(-0.6, -0.6, 0.6, 0.6)
+                return rect
+        except (AttributeError, RuntimeError, TypeError):
+            return QRectF()
+        return QRectF()
+
+    def _start_selection_drag_preview(self, scene_point):
+        """Track the visible bounds during native Select/Move drags.
+
+        QGIS moves the selected layout item after this viewport event filter
+        returns. Without an active preview, the custom scene overlay keeps the
+        old selected-bounds rectangle until the native drag completes. Store a
+        snapshot on press and translate it by the cursor delta during the drag;
+        a queued sync on release replaces it with the exact final item bounds.
+        """
+        if self._is_edit_nodes_tool():
+            return
+        item = getattr(self, "_selection_bounds_item", None)
+        if item is None:
+            return
+        try:
+            if not item.isSelected() or item.type() not in (SPLINE_POLYGON_TYPE, SPLINE_POLYLINE_TYPE):
+                return
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        rect = self._current_selection_bounds_rect()
+        if rect.isNull() or not rect.isValid():
+            return
+        self._selection_drag_item = item
+        self._selection_drag_start_scene = QPointF(scene_point)
+        self._selection_drag_start_rect = QRectF(rect)
+
+    def _update_selection_drag_preview(self, scene_point):
+        if self._selection_drag_item is None or self._selection_drag_start_scene is None:
+            return False
+        rect = QRectF(self._selection_drag_start_rect)
+        if rect.isNull() or not rect.isValid():
+            return False
+        delta = QPointF(scene_point) - QPointF(self._selection_drag_start_scene)
+        rect.translate(delta)
+        try:
+            self._selection_bounds_overlay.setSceneRect(rect)
+        except (AttributeError, RuntimeError):
+            return False
+        return True
+
+    def _clear_selection_drag_preview(self):
+        self._selection_drag_item = None
+        self._selection_drag_start_scene = None
+        self._selection_drag_start_rect = QRectF()
+
+    def _selection_changed(self):
+        """Synchronize selection visuals immediately after selection changes.
+
+        Using the zero-timeout coalescing timer here allows QGIS' native
+        node-extents mouse-handle frame to paint for one event-loop turn before
+        the spline item draws its corrected curve bounds.  Run this pass
+        immediately for selection changes only; high-frequency mouse movement
+        still uses the queued path.
+        """
+        try:
+            self._sync_overlay()
+        except RuntimeError:
+            return
 
     def _queue_overlay_sync(self):
         timer = getattr(self, "_sync_timer", None)
@@ -439,6 +664,8 @@ class BezierHandleController(QObject):
             self._finish(cancel=True)
         self._clear_hover()
         self._hide_snap_lines()
+        self._clear_selection_drag_preview()
+        self._selection_candidate_press_scene = None
         self._clear_creation_state()
         self._pending_creation = None
         self._queue_overlay_sync()
@@ -564,6 +791,23 @@ class BezierHandleController(QObject):
             return False
 
         if event_type == _event_type("MouseButtonPress"):
+            # Select/Move drags are owned by QGIS, but our custom selection
+            # bounds overlay must follow them. Cache the press point and, if a
+            # spline is already selected, start a translated overlay preview.
+            # If the press itself selects the spline, the first MouseMove will
+            # start the preview after QGIS has updated the selection.
+            if event.button() == _left_button() and self._is_select_move_tool():
+                scene_point = self._scene_position(event)
+                self._selection_candidate_press_scene = QPointF(scene_point)
+                self._start_selection_drag_preview(scene_point)
+                return False
+            elif event.button() == _left_button():
+                # A non-select tool may still leave a spline selected while the
+                # user drags to create another item. Do not let that gesture
+                # become a translated spline-bounds preview.
+                self._clear_selection_drag_preview()
+                self._selection_candidate_press_scene = None
+
             # Bezier handles and spline anchors are Edit Nodes affordances.
             # Give them first refusal before QGIS' native Edit Nodes tool sees
             # the press. Otherwise the native tool can select/move the nearest
@@ -636,8 +880,28 @@ class BezierHandleController(QObject):
             except AttributeError:
                 buttons = _no_button()
             if buttons != _no_button():
-                # Native anchor dragging changes geometry after this filter.
+                # Native item dragging happens after this filter. Keep the
+                # custom selected-bounds overlay visually attached to the item
+                # during Select/Move drags by translating the original bounds
+                # with the mouse delta. When the press selected the spline, the
+                # selection was not available at press-filter time, so lazily
+                # start from the cached press point on the first drag move.
                 self._clear_hover()
+                if self._is_select_move_tool():
+                    if self._selection_drag_item is None:
+                        start_point = self._selection_candidate_press_scene or self._scene_position(event)
+                        self._start_selection_drag_preview(start_point)
+                    self._update_selection_drag_preview(self._scene_position(event))
+                    try:
+                        QTimer.singleShot(0, self._sync_native_mouse_handles_visibility)
+                    except RuntimeError:
+                        pass
+                else:
+                    # Another layout tool is using this drag (for example, Add
+                    # Label/Text Box). Keep the selected spline's bounds synced
+                    # to the actual item position only, never to the cursor.
+                    self._clear_selection_drag_preview()
+                    self._selection_candidate_press_scene = None
                 self._queue_overlay_sync()
             elif self._is_edit_nodes_tool():
                 # Hover assistance is deliberately visual-only. This performs
@@ -654,6 +918,9 @@ class BezierHandleController(QObject):
             _event_type("Resize"),
         ):
             self._clear_hover()
+            if event_type == _event_type("MouseButtonRelease"):
+                self._clear_selection_drag_preview()
+                self._selection_candidate_press_scene = None
             # Native QGIS tools update geometry after this filter returns.
             self._queue_overlay_sync()
         return False
@@ -708,6 +975,38 @@ class BezierHandleController(QObject):
             return None
 
         return item_type if item_type in (SPLINE_POLYLINE_TYPE, SPLINE_POLYGON_TYPE) else None
+
+
+    def _is_select_move_tool(self):
+        """Return True only for QGIS' native Select/Move Item tool.
+
+        The selected-bounds drag preview must not run while another layout
+        creation tool (e.g. Add Label/Text Box, Add Map, Add Shape) is active.
+        Those tools can leave a spline selected while the user drags to create
+        something else; treating those drags as spline moves makes the custom
+        bounds overlay follow the cursor even though the spline itself is not
+        moving.  Use the view tool's class/meta-object names instead of a hard
+        import so this remains tolerant of SIP wrapper differences.
+        """
+        try:
+            tool = self.view.tool()
+        except RuntimeError:
+            return False
+        if tool is None:
+            return False
+
+        names = [type(tool).__name__]
+        try:
+            names.append(str(tool.metaObject().className()))
+        except (AttributeError, RuntimeError):
+            pass
+        joined = " ".join(names)
+
+        # Exclude all creation/edit node tools explicitly. The select/move tool
+        # is the only tool allowed to drive the translated bounds preview.
+        if "EditNodes" in joined or "Add" in joined or "Create" in joined:
+            return False
+        return "Select" in joined or "Move" in joined
 
     def _is_edit_nodes_tool(self):
         try:
@@ -966,34 +1265,81 @@ class BezierHandleController(QObject):
                 continue
 
     def _sync_native_mouse_handles_visibility(self):
-        """Shows the native selection frame except while editing spline nodes.
+        """Keeps QGIS selection mechanics while customizing spline visuals.
 
-        Select/Move Item keeps QGIS' normal bounding box visible so users retain
-        the familiar selected-item feedback.  Edit Nodes makes that frame
-        transparent for spline-only selections, leaving just native anchors and
-        the plugin's Bezier handles/guides visible.  No QGIS-owned graphics-item
-        wrapper is cached for later restoration.
+        Edit Nodes hides the native frame so only anchors/Bezier handles are
+        shown. For a single selected spline in Select/Move mode, the native
+        frame is made transparent and the spline item draws a replacement
+        frame around the visible Bezier curve extent. The native QGIS
+        mouse-handle item remains alive so selection, movement and deselection
+        continue to work normally.
         """
         try:
             selected = list(self.layout.selectedLayoutItems()) if self.layout is not None else []
         except (AttributeError, RuntimeError, TypeError):
             selected = []
 
-        hide = (
-            self._is_edit_nodes_tool()
-            and bool(selected)
+        spline_only = (
+            bool(selected)
             and all(
                 item.type() in (SPLINE_POLYLINE_TYPE, SPLINE_POLYGON_TYPE)
                 for item in selected
             )
         )
+        edit_nodes = self._is_edit_nodes_tool()
+        show_expanded_selection_bounds = (
+            not edit_nodes
+            and len(selected) == 1
+            and selected[0].type() in (SPLINE_POLYGON_TYPE, SPLINE_POLYLINE_TYPE)
+            and hasattr(selected[0], "_path")
+        )
 
         # During normal interaction it is safe to operate on the fresh scene
-        # item returned in this same synchronization pass. Restore visibility
-        # when selection changes away from spline-only. detach() deliberately
+        # item returned in this same synchronization pass. detach() deliberately
         # does not perform a final restore because Qt teardown may already have
         # invalidated the underlying C++ QGraphicsItem.
-        self._set_native_mouse_handles_opacity(0.0 if hide else 1.0)
+        self._set_native_mouse_handles_opacity(0.0 if (edit_nodes and spline_only) or show_expanded_selection_bounds else 1.0)
+
+        previous_bounds_item = getattr(self, "_selection_bounds_item", None)
+        next_bounds_item = selected[0] if show_expanded_selection_bounds else None
+        if previous_bounds_item is not None and previous_bounds_item is not next_bounds_item:
+            try:
+                if hasattr(previous_bounds_item, "_clear_selection_bounds_decoration"):
+                    previous_bounds_item._clear_selection_bounds_decoration()
+                else:
+                    previous_bounds_item._layout_splines_draw_selection_bounds = False
+                    previous_bounds_item.update()
+            except (AttributeError, RuntimeError):
+                pass
+
+        # Draw selected bounds from a transient scene overlay instead of from the
+        # spline item paint routine. Item-level GUI decoration can leave stale
+        # corner marks after deselection when QGIS does not repaint the old
+        # decoration area. A removable overlay gives explicit cleanup: empty
+        # rectangle on deselect means there is nothing left in the scene to
+        # repaint or persist.
+        #
+        # While the native Select/Move tool is dragging the item, the custom
+        # overlay is intentionally translated from the mouse delta before QGIS
+        # has committed the item's final scene position. Do not recompute the
+        # rectangle from the item's stored geometry during that active drag,
+        # because timer/idle syncs can fire when the cursor pauses and would snap
+        # the overlay back to the old/default item position until the next mouse
+        # move. The drag preview remains authoritative until mouse release, and
+        # the release sync then replaces it with the exact final bounds.
+        active_drag_preview = (
+            self._selection_drag_item is not None
+            and self._selection_drag_start_scene is not None
+            and next_bounds_item is self._selection_drag_item
+        )
+        self._selection_bounds_item = next_bounds_item
+        if active_drag_preview:
+            return
+        overlay_rect = self._current_selection_bounds_rect() if next_bounds_item is not None else QRectF()
+        try:
+            self._selection_bounds_overlay.setSceneRect(overlay_rect)
+        except (AttributeError, RuntimeError):
+            pass
 
     def _selected_splines(self):
         return [
@@ -1197,33 +1543,54 @@ class BezierHandleController(QObject):
     def _refresh_hover_visual(self):
         target = self._hover_target
         hovered_handle_key = None
+        hovered_anchor_key = None
         if target is not None and target[0] == "handle":
             hovered_handle_key = (target[1], target[2], target[3])
+        elif target is not None and target[0] == "anchor":
+            hovered_anchor_key = (target[1], target[2])
+
+        active_handle_key = None
+        if self.active is not None:
+            active_handle_key = (self.active[0], self.active[1], self.active[2])
+        active_anchor_key = None
+        if self._active_anchor is not None:
+            active_anchor_key = (self._active_anchor[0], self._active_anchor[1])
+
         for index, handle in enumerate(self._handle_overlays):
             key = self._overlay_keys[index] if index < len(self._overlay_keys) else None
-            handle.setHovered(key == hovered_handle_key)
+            handle.setState(key == hovered_handle_key, key == active_handle_key)
 
-        if target is not None and target[0] == "anchor":
-            point = QPointF()
-            try:
-                valid = target[1].nodePosition(target[2], point)
-            except RuntimeError:
-                valid = False
-            if valid:
-                self._hover_anchor_overlay.setPos(point)
-                self._hover_anchor_overlay.show()
-                return
-        self._hover_anchor_overlay.hide()
+        for index, anchor_overlay in enumerate(self._anchor_overlays):
+            key = self._anchor_overlay_keys[index] if index < len(self._anchor_overlay_keys) else None
+            anchor_overlay.setState(key == hovered_anchor_key, key == active_anchor_key)
+
+        # The previous single hover-ring overlay is no longer used now that all
+        # selected anchors have native-looking circular overlays. Hide it if it
+        # exists so only the current marker set is visible.
+        try:
+            self._hover_anchor_overlay.hide()
+        except RuntimeError:
+            return
 
     def _new_handle_overlay(self):
         scene = self.view.scene()
         handle = _PreviewHandleItem(self.view.currentLayout())
         handle.setFlag(_ignore_transformations_flag(), True)
-        handle.setZValue(1.0e9 + 1.0)
+        handle.setZValue(1.0e9 + 2.0)
         handle.setAcceptedMouseButtons(_no_button())
         handle.hide()
         scene.addItem(handle)
         self._handle_overlays.append(handle)
+
+    def _new_anchor_overlay(self):
+        scene = self.view.scene()
+        anchor_overlay = _AnchorOverlayItem(self.view.currentLayout())
+        anchor_overlay.setFlag(_ignore_transformations_flag(), True)
+        anchor_overlay.setZValue(1.0e9 + 2.1)
+        anchor_overlay.setAcceptedMouseButtons(_no_button())
+        anchor_overlay.hide()
+        scene.addItem(anchor_overlay)
+        self._anchor_overlays.append(anchor_overlay)
 
     def _sync_overlay(self):
         self._sync_native_mouse_handles_visibility()
@@ -1245,10 +1612,18 @@ class BezierHandleController(QObject):
                     handle.hide()
                 except RuntimeError:
                     continue
+            for anchor_overlay in self._anchor_overlays:
+                try:
+                    anchor_overlay.setState(False, False)
+                    anchor_overlay.hide()
+                except RuntimeError:
+                    continue
             return
 
         points = []
         keys = []
+        anchor_points = []
+        anchor_keys = []
         guide_lines = []
         try:
             for item in self._selected_splines():
@@ -1256,6 +1631,12 @@ class BezierHandleController(QObject):
                 # nodePosition() is QGIS' public scene-coordinate API for layout
                 # node items, so it remains authoritative while Edit Nodes is
                 # active and avoids duplicating native coordinate conversion.
+                nodes = list(item.nodes())
+                for anchor in range(len(nodes)):
+                    anchor_scene = QPointF()
+                    if item.nodePosition(anchor, anchor_scene):
+                        anchor_points.append(QPointF(anchor_scene))
+                        anchor_keys.append((item, anchor))
                 for anchor, kind, handle_scene in item.bezierHandleScenePoints():
                     anchor_scene = QPointF()
                     if item.nodePosition(anchor, anchor_scene):
@@ -1266,23 +1647,35 @@ class BezierHandleController(QObject):
             # A selected item may disappear while the designer is closing.
             points = []
             keys = []
+            anchor_points = []
+            anchor_keys = []
             guide_lines = []
 
         while len(self._handle_overlays) < len(points):
             self._new_handle_overlay()
+        while len(self._anchor_overlays) < len(anchor_points):
+            self._new_anchor_overlay()
 
         # One atomic guide snapshot eliminates transient combinations of old
         # and new line endpoints during hover/zoom repaints.
         self._guide_overlay.setLines(guide_lines)
 
         self._overlay_keys = keys
+        self._anchor_overlay_keys = anchor_keys
         for index, handle in enumerate(self._handle_overlays):
             if index < len(points):
                 handle.setPos(points[index])
                 handle.show()
             else:
-                handle.setHovered(False)
+                handle.setState(False, False)
                 handle.hide()
+        for index, anchor_overlay in enumerate(self._anchor_overlays):
+            if index < len(anchor_points):
+                anchor_overlay.setPos(anchor_points[index])
+                anchor_overlay.show()
+            else:
+                anchor_overlay.setState(False, False)
+                anchor_overlay.hide()
         self._refresh_hover_visual()
 
     def _finish(self, cancel=False):
